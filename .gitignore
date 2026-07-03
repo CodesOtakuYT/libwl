@@ -1,0 +1,15 @@
+buildDir/
+subprojects/
+*.o
+*.a
+*.so
+*.swp
+*.swo
+*~
+.DS_Store
+compile_commands.json
+.ninja_*
+meson-info/
+meson-logs/
+meson-private/
+.idea/
