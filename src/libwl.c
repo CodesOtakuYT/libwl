@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <signal.h>
 
 #include <drm_fourcc.h>
@@ -28,11 +29,10 @@ static const struct wl_callback_listener frame_listener = {
 
 /* ── buffer listeners ────────────────────────────────────────────── */
 
-static void on_buffer_release(void *data, struct wl_buffer *wl_buffer)
+static void on_buffer_release(void *data, [[maybe_unused]] struct wl_buffer *wl_buffer)
 {
     LibwlBuffer *buf = data;
-    (void)wl_buffer;
-    buf->busy = 0;
+    buf->busy = false;
 }
 
 static const struct wl_buffer_listener buffer_listener = {
@@ -81,7 +81,7 @@ static void create_vk_image(Libwl *lib, LibwlBuffer *buf)
         image_ci.pNext  = &ext_ci;
     }
 
-    ret = vkCreateImage(lib->dev, &image_ci, NULL, &buf->image);
+    ret = vkCreateImage(lib->dev, &image_ci, nullptr, &buf->image);
     assert(ret == VK_SUCCESS);
 
     int fd = dup(buf->dmabuf_fd);
@@ -121,7 +121,7 @@ static void create_vk_image(Libwl *lib, LibwlBuffer *buf)
         .memoryTypeIndex = (uint32_t)(__builtin_ffs((int)mem_type_bits) - 1),
     };
 
-    ret = vkAllocateMemory(lib->dev, &alloc_info, NULL, &buf->memory);
+    ret = vkAllocateMemory(lib->dev, &alloc_info, nullptr, &buf->memory);
     assert(ret == VK_SUCCESS);
 
     VkBindImageMemoryInfo bind_info = {
@@ -146,7 +146,7 @@ static void create_vk_image(Libwl *lib, LibwlBuffer *buf)
         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
         .flags = VK_FENCE_CREATE_SIGNALED_BIT,
     };
-    ret = vkCreateFence(lib->dev, &fence_info, NULL, &buf->fence);
+    ret = vkCreateFence(lib->dev, &fence_info, nullptr, &buf->fence);
     assert(ret == VK_SUCCESS);
 }
 
@@ -198,10 +198,10 @@ static int create_buffer(Libwl *lib, LibwlBuffer *buf, int width, int height)
 
 static void destroy_buffer(Libwl *lib, LibwlBuffer *buf)
 {
-    if (buf->fence)   vkDestroyFence(lib->dev, buf->fence, NULL);
+    if (buf->fence)   vkDestroyFence(lib->dev, buf->fence, nullptr);
     if (buf->cmd)     vkFreeCommandBuffers(lib->dev, lib->cmd_pool, 1, &buf->cmd);
-    if (buf->memory)  vkFreeMemory(lib->dev, buf->memory, NULL);
-    if (buf->image)   vkDestroyImage(lib->dev, buf->image, NULL);
+    if (buf->memory)  vkFreeMemory(lib->dev, buf->memory, nullptr);
+    if (buf->image)   vkDestroyImage(lib->dev, buf->image, nullptr);
     if (buf->wl_buf)  wl_buffer_destroy(buf->wl_buf);
     if (buf->bo)      gbm_bo_destroy(buf->bo);
     if (buf->dmabuf_fd >= 0) close(buf->dmabuf_fd);
@@ -218,7 +218,7 @@ static void recreate_buffers(Libwl *lib, int width, int height)
     }
     lib->width  = width;
     lib->height = height;
-    lib->pending_resize = 0;
+    lib->pending_resize = false;
 }
 
 static LibwlBuffer *next_free_buffer(Libwl *lib)
@@ -227,7 +227,7 @@ static LibwlBuffer *next_free_buffer(Libwl *lib)
         if (!lib->buffers[i].busy)
             return &lib->buffers[i];
     }
-    return NULL;
+    return nullptr;
 }
 
 /* ── Vulkan setup ────────────────────────────────────────────────── */
@@ -236,20 +236,24 @@ static int setup_vulkan(Libwl *lib, const LibwlConfig *cfg)
 {
     VkResult ret;
 
+    // Temp allocations use the arena — freed implicitly after setup
+    size_t mark = arena_save(&lib->arena);
+
     const char *base_instance_exts[] = {
         VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,
         VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
     };
     int num_inst_exts = 2;
-    const char **inst_exts = NULL;
+    const char **inst_exts = nullptr;
 
     if (cfg->extra_instance_ext_count > 0) {
-        inst_exts = malloc((num_inst_exts + cfg->extra_instance_ext_count) * sizeof(char*));
-        if (!inst_exts) return -1;
+        int n = num_inst_exts + cfg->extra_instance_ext_count;
+        inst_exts = arena_alloc(&lib->arena, (size_t)n * sizeof(char*));
+        if (!inst_exts) goto fail;
         memcpy(inst_exts, base_instance_exts, num_inst_exts * sizeof(char*));
         memcpy(inst_exts + num_inst_exts, cfg->extra_instance_exts,
                cfg->extra_instance_ext_count * sizeof(char*));
-        num_inst_exts += cfg->extra_instance_ext_count;
+        num_inst_exts = n;
     } else {
         inst_exts = (const char**)base_instance_exts;
     }
@@ -257,7 +261,7 @@ static int setup_vulkan(Libwl *lib, const LibwlConfig *cfg)
     VkApplicationInfo app = {
         .sType            = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pApplicationName = cfg->title ? cfg->title : "libwl",
-        .apiVersion       = VK_MAKE_VERSION(1, 0, 0),
+        .apiVersion       = VK_MAKE_API_VERSION(0, 1, 4, 0),
     };
     VkInstanceCreateInfo ici = {
         .sType                   = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -266,23 +270,24 @@ static int setup_vulkan(Libwl *lib, const LibwlConfig *cfg)
         .enabledExtensionCount   = (uint32_t)num_inst_exts,
         .ppEnabledExtensionNames = inst_exts,
     };
-    ret = vkCreateInstance(&ici, NULL, &lib->inst);
-    if (inst_exts != (const char**)base_instance_exts)
-        free(inst_exts);
-    if (ret != VK_SUCCESS) return -1;
+    ret = vkCreateInstance(&ici, nullptr, &lib->inst);
+    if (ret != VK_SUCCESS) goto fail;
 
     uint32_t count;
-    ret = vkEnumeratePhysicalDevices(lib->inst, &count, NULL);
-    if (ret != VK_SUCCESS || count == 0) return -1;
+    ret = vkEnumeratePhysicalDevices(lib->inst, &count, nullptr);
+    if (ret != VK_SUCCESS || count == 0) goto fail;
 
-    VkPhysicalDevice *devs = malloc(count * sizeof(VkPhysicalDevice));
+    VkPhysicalDevice *devs = arena_alloc(&lib->arena,
+                                         count * sizeof(VkPhysicalDevice));
+    if (!devs) goto fail;
     ret = vkEnumeratePhysicalDevices(lib->inst, &count, devs);
-    if (ret != VK_SUCCESS) { free(devs); return -1; }
+    if (ret != VK_SUCCESS) goto fail;
     lib->phys_dev = devs[0];
-    free(devs);
 
-    vkGetPhysicalDeviceQueueFamilyProperties(lib->phys_dev, &count, NULL);
-    VkQueueFamilyProperties *props = malloc(count * sizeof(VkQueueFamilyProperties));
+    vkGetPhysicalDeviceQueueFamilyProperties(lib->phys_dev, &count, nullptr);
+    VkQueueFamilyProperties *props = arena_alloc(&lib->arena,
+        count * sizeof(VkQueueFamilyProperties));
+    if (!props) goto fail;
     vkGetPhysicalDeviceQueueFamilyProperties(lib->phys_dev, &count, props);
     lib->queue_family = UINT32_MAX;
     for (uint32_t i = 0; i < count; i++) {
@@ -291,8 +296,7 @@ static int setup_vulkan(Libwl *lib, const LibwlConfig *cfg)
             break;
         }
     }
-    free(props);
-    if (lib->queue_family == UINT32_MAX) return -1;
+    if (lib->queue_family == UINT32_MAX) goto fail;
 
     const char *base_device_exts[] = {
         VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
@@ -305,15 +309,16 @@ static int setup_vulkan(Libwl *lib, const LibwlConfig *cfg)
         VK_KHR_MAINTENANCE_1_EXTENSION_NAME,
     };
     int num_dev_exts = 8;
-    const char **dev_exts = NULL;
+    const char **dev_exts = nullptr;
 
     if (cfg->extra_device_ext_count > 0) {
-        dev_exts = malloc((num_dev_exts + cfg->extra_device_ext_count) * sizeof(char*));
-        if (!dev_exts) return -1;
+        int n = num_dev_exts + cfg->extra_device_ext_count;
+        dev_exts = arena_alloc(&lib->arena, (size_t)n * sizeof(char*));
+        if (!dev_exts) goto fail;
         memcpy(dev_exts, base_device_exts, num_dev_exts * sizeof(char*));
         memcpy(dev_exts + num_dev_exts, cfg->extra_device_exts,
                cfg->extra_device_ext_count * sizeof(char*));
-        num_dev_exts += cfg->extra_device_ext_count;
+        num_dev_exts = n;
     } else {
         dev_exts = (const char**)base_device_exts;
     }
@@ -333,10 +338,8 @@ static int setup_vulkan(Libwl *lib, const LibwlConfig *cfg)
         .enabledExtensionCount   = (uint32_t)num_dev_exts,
         .ppEnabledExtensionNames = dev_exts,
     };
-    ret = vkCreateDevice(lib->phys_dev, &dci, NULL, &lib->dev);
-    if (dev_exts != (const char**)base_device_exts)
-        free(dev_exts);
-    if (ret != VK_SUCCESS) return -1;
+    ret = vkCreateDevice(lib->phys_dev, &dci, nullptr, &lib->dev);
+    if (ret != VK_SUCCESS) goto fail;
 
     vkGetDeviceQueue(lib->dev, lib->queue_family, 0, &lib->queue);
 
@@ -345,8 +348,8 @@ static int setup_vulkan(Libwl *lib, const LibwlConfig *cfg)
         .flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
         .queueFamilyIndex = lib->queue_family,
     };
-    ret = vkCreateCommandPool(lib->dev, &cpi, NULL, &lib->cmd_pool);
-    if (ret != VK_SUCCESS) return -1;
+    ret = vkCreateCommandPool(lib->dev, &cpi, nullptr, &lib->cmd_pool);
+    if (ret != VK_SUCCESS) goto fail;
 
     lib->vkGetImageMemoryRequirements2KHR =
         (PFN_vkGetImageMemoryRequirements2KHR)
@@ -361,17 +364,21 @@ static int setup_vulkan(Libwl *lib, const LibwlConfig *cfg)
     if (!lib->vkGetImageMemoryRequirements2KHR ||
         !lib->vkGetMemoryFdPropertiesKHR ||
         !lib->vkBindImageMemory2KHR)
-        return -1;
+        goto fail;
 
+    arena_restore(&lib->arena, mark);
     return 0;
+
+fail:
+    arena_restore(&lib->arena, mark);
+    return -1;
 }
 
 /* ── xdg_wm_base ping ────────────────────────────────────────────── */
 
-static void on_wm_base_ping(void *data, struct xdg_wm_base *wm_base,
+static void on_wm_base_ping([[maybe_unused]] void *data, struct xdg_wm_base *wm_base,
                             uint32_t serial)
 {
-    (void)data;
     xdg_wm_base_pong(wm_base, serial);
 }
 
@@ -381,24 +388,22 @@ static const struct xdg_wm_base_listener wm_base_listener = {
 
 /* ── xdg_toplevel listeners ──────────────────────────────────────── */
 
-static void on_toplevel_configure(void *data, struct xdg_toplevel *toplevel,
+static void on_toplevel_configure(void *data, [[maybe_unused]] struct xdg_toplevel *toplevel,
                                   int32_t w, int32_t h,
-                                  struct wl_array *states)
+                                  [[maybe_unused]] struct wl_array *states)
 {
     Libwl *lib = data;
-    (void)toplevel; (void)states;
     if (w > 0 && h > 0 && (lib->width != w || lib->height != h)) {
         lib->width  = w;
         lib->height = h;
-        lib->pending_resize = 1;
+        lib->pending_resize = true;
     }
 }
 
-static void on_toplevel_close(void *data, struct xdg_toplevel *toplevel)
+static void on_toplevel_close(void *data, [[maybe_unused]] struct xdg_toplevel *toplevel)
 {
     Libwl *lib = data;
-    (void)toplevel;
-    lib->running = 0;
+    lib->running = false;
     if (lib->event)
         sd_event_exit(lib->event, 0);
 }
@@ -431,9 +436,9 @@ static void on_surface_configure(void *data, struct xdg_surface *xdg_surface,
 {
     Libwl *lib = data;
     xdg_surface_ack_configure(xdg_surface, serial);
-    lib->pending_configure = 0;
+    lib->pending_configure = false;
     if (lib->initialized)
-        on_frame_done(lib, NULL, 0);
+        on_frame_done(lib, nullptr, 0);
 }
 
 static const struct xdg_surface_listener surface_listener = {
@@ -448,7 +453,7 @@ static void on_pointer_enter(void *data, struct wl_pointer *pointer,
 {
     Libwl *lib = data;
     (void)pointer; (void)serial; (void)surface;
-    lib->pointer_entered = 1;
+    lib->pointer_entered = true;
     lib->pointer_x = wl_fixed_to_double(sx);
     lib->pointer_y = wl_fixed_to_double(sy);
 }
@@ -458,7 +463,7 @@ static void on_pointer_leave(void *data, struct wl_pointer *pointer,
 {
     Libwl *lib = data;
     (void)pointer; (void)serial; (void)surface;
-    lib->pointer_entered = 0;
+    lib->pointer_entered = false;
 }
 
 static void on_pointer_motion(void *data, struct wl_pointer *pointer,
@@ -531,7 +536,7 @@ static void on_keyboard_enter(void *data, struct wl_keyboard *keyboard,
 {
     Libwl *lib = data;
     (void)keyboard; (void)serial; (void)surface;
-    lib->keyboard_entered = 1;
+    lib->keyboard_entered = true;
     memset(lib->pressed_keys, 0, 256);
     uint32_t *k;
     for (k = (uint32_t*)keys->data;
@@ -545,7 +550,7 @@ static void on_keyboard_leave(void *data, struct wl_keyboard *keyboard,
 {
     Libwl *lib = data;
     (void)keyboard; (void)serial; (void)surface;
-    lib->keyboard_entered = 0;
+    lib->keyboard_entered = false;
     memset(lib->pressed_keys, 0, 256);
 }
 
@@ -634,7 +639,7 @@ static void on_registry_global(void *data, struct wl_registry *registry,
 
 static const struct wl_registry_listener registry_listener = {
     .global        = on_registry_global,
-    .global_remove = NULL,
+    .global_remove = nullptr,
 };
 
 /* ── frame callback cycle ─────────────────────────────────────────── */
@@ -645,7 +650,7 @@ static void on_frame_done(void *data, struct wl_callback *cb, uint32_t time)
     (void)time;
     if (cb) {
         wl_callback_destroy(cb);
-        lib->frame_callback = NULL;
+        lib->frame_callback = nullptr;
     }
 
     if (lib->pending_resize)
@@ -677,9 +682,11 @@ static void on_frame_done(void *data, struct wl_callback *cb, uint32_t time)
 int libwl_create(Libwl *lib, const LibwlConfig *cfg)
 {
     memset(lib, 0, sizeof(*lib));
+    if (!arena_init(&lib->arena)) return -1;
+
     lib->format = GBM_FORMAT_XRGB8888;
 
-    lib->wl = wl_display_connect(NULL);
+    lib->wl = wl_display_connect(nullptr);
     if (!lib->wl) return -1;
 
     lib->registry = wl_display_get_registry(lib->wl);
@@ -710,7 +717,7 @@ int libwl_create(Libwl *lib, const LibwlConfig *cfg)
     xdg_toplevel_set_title(lib->xdg_toplevel,
                            cfg->title ? cfg->title : "libwl");
 
-    lib->pending_configure = 1;
+    lib->pending_configure = true;
     wl_surface_commit(lib->surface);
 
     for (int i = 0; i < LIBWL_NUM_BUFFERS; i++) {
@@ -727,7 +734,7 @@ void libwl_destroy(Libwl *lib)
 
     if (lib->frame_callback)
         wl_callback_destroy(lib->frame_callback);
-    lib->frame_callback = NULL;
+    lib->frame_callback = nullptr;
 
     for (int i = 0; i < LIBWL_NUM_BUFFERS; i++)
         destroy_buffer(lib, &lib->buffers[i]);
@@ -739,9 +746,9 @@ void libwl_destroy(Libwl *lib)
     if (lib->xdg_surface)  xdg_surface_destroy(lib->xdg_surface);
     if (lib->surface)      wl_surface_destroy(lib->surface);
 
-    if (lib->cmd_pool)  vkDestroyCommandPool(lib->dev, lib->cmd_pool, NULL);
-    if (lib->dev)       vkDestroyDevice(lib->dev, NULL);
-    if (lib->inst)      vkDestroyInstance(lib->inst, NULL);
+    if (lib->cmd_pool)  vkDestroyCommandPool(lib->dev, lib->cmd_pool, nullptr);
+    if (lib->dev)       vkDestroyDevice(lib->dev, nullptr);
+    if (lib->inst)      vkDestroyInstance(lib->inst, nullptr);
 
     if (lib->gbm)       gbm_device_destroy(lib->gbm);
     if (lib->drm_fd >= 0) close(lib->drm_fd);
@@ -779,7 +786,7 @@ int libwl_present(Libwl *lib)
     wl_callback_add_listener(lib->frame_callback, &frame_listener, lib);
     wl_surface_commit(lib->surface);
     wl_display_flush(lib->wl);
-    buf->busy = 1;
+    buf->busy = true;
 
     return 0;
 }
@@ -800,7 +807,7 @@ void libwl_clear(Libwl *lib, float r, float g, float b, float a)
     vkCmdPipelineBarrier(buf->cmd,
         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-        0, NULL, 0, NULL, 1, &barrier);
+        0, nullptr, 0, nullptr, 1, &barrier);
 
     VkClearColorValue color = {{ r, g, b, a }};
     VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
@@ -820,7 +827,7 @@ void libwl_clear(Libwl *lib, float r, float g, float b, float a)
     vkCmdPipelineBarrier(buf->cmd,
         VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
-        0, NULL, 0, NULL, 1, &barrier2);
+        0, nullptr, 0, nullptr, 1, &barrier2);
 }
 
 /* ── sd_event callbacks ──────────────────────────────────────────── */
@@ -858,27 +865,27 @@ static int on_signal(sd_event_source *s, const struct signalfd_siginfo *si,
 
 int libwl_run(Libwl *lib, libwl_frame_fn frame_cb, void *user)
 {
-    lib->running    = 1;
+    lib->running    = true;
     lib->frame_cb   = frame_cb;
     lib->frame_user = user;
-    lib->initialized = 1;
+    lib->initialized = true;
 
     int r = sd_event_new(&lib->event);
     if (r < 0) return -1;
 
     int wl_fd = wl_display_get_fd(lib->wl);
-    r = sd_event_add_io(lib->event, NULL, wl_fd, EPOLLIN, on_wl_event, lib);
+    r = sd_event_add_io(lib->event, nullptr, wl_fd, EPOLLIN, on_wl_event, lib);
     if (r < 0) return -1;
 
     sigset_t mask;
     sigemptyset(&mask);
     sigaddset(&mask, SIGINT);
     sigaddset(&mask, SIGTERM);
-    sigprocmask(SIG_BLOCK, &mask, NULL);
+    pthread_sigmask(SIG_BLOCK, &mask, nullptr);
 
-    r = sd_event_add_signal(lib->event, NULL, SIGINT, on_signal, lib);
+    r = sd_event_add_signal(lib->event, nullptr, SIGINT, on_signal, lib);
     if (r < 0) return -1;
-    r = sd_event_add_signal(lib->event, NULL, SIGTERM, on_signal, lib);
+    r = sd_event_add_signal(lib->event, nullptr, SIGTERM, on_signal, lib);
     if (r < 0) return -1;
 
     if (!lib->pending_configure) {
@@ -892,7 +899,7 @@ int libwl_run(Libwl *lib, libwl_frame_fn frame_cb, void *user)
     r = sd_event_loop(lib->event);
 
     sd_event_unref(lib->event);
-    lib->event = NULL;
+    lib->event = nullptr;
 
     return r < 0 ? -1 : 0;
 }

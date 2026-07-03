@@ -5,9 +5,8 @@
 
 static float t = 0;
 
-static void frame(Libwl *lib, void *user)
+static void frame(Libwl *lib, [[maybe_unused]] void *user)
 {
-    (void)user;
     VkCommandBuffer cmd = lib->cur_buf->cmd;
     VkImage         img = lib->cur_buf->image;
 
@@ -27,7 +26,7 @@ static void frame(Libwl *lib, void *user)
     vkCmdPipelineBarrier(cmd,
         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-        0, NULL, 0, NULL, 1, &barrier);
+        0, nullptr, 0, nullptr, 1, &barrier);
 
     VkClearColorValue color = {{ r, g, b, 1.0f }};
     VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
@@ -36,7 +35,7 @@ static void frame(Libwl *lib, void *user)
 
     if (libwl_present(lib) != 0) {
         fprintf(stderr, "libwl_present failed\n");
-        lib->running = 0;
+        lib->running = false;
     }
 }
 
@@ -59,7 +58,8 @@ int main(void)
     printf("libwl: drm_fd %d, gbm %p, format 0x%x\n",
            lib.drm_fd, (void*)lib.gbm, lib.format);
 
-    libwl_run(&lib, frame, NULL);
+    int r = libwl_run(&lib, frame, nullptr);
+    if (r < 0) fprintf(stderr, "libwl_run failed\n");
     libwl_destroy(&lib);
     return 0;
 }
